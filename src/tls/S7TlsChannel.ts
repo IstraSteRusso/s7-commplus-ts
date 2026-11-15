@@ -40,10 +40,14 @@ export class S7TlsChannel {
     // TLS 1.3 is forced, because with TLS on top of IsoOnTCP the overhead of the encryption must be known
     // (for fragmenting S7CommPlus PDUs). With GCM there is no padding, the overhead is always 16 bytes.
     // TLS_CHACHA20_POLY1305_SHA256 is also a TLS 1.3 suite, so the allowed suites are set explicitly.
+    // Only classic key exchange groups: newer OpenSSL versions (3.5+, e.g. the one bundled with Node 26) also offer the
+    // post-quantum hybrid X25519MLKEM768 by default. That makes the ClientHello ~1450 bytes, larger than the negotiated
+    // TPDU size (1024 bytes): the PLC closes the connection and connect() returns errTCPDataSend (7).
     this.sock = tls.connect({
       socket: this.duplex,
       minVersion: "TLSv1.3",
       ciphers: "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256",
+      ecdhCurve: "X25519:P-256:P-384",
       rejectUnauthorized: false,
     });
     this.handshake = new Promise<void>((resolve, reject) => {
