@@ -48,7 +48,7 @@ export async function legitimate(
   // S7-1214C  (6ES7 214-1AG40-0XB0)           1;6ES7 214-1AG40-0XB0 ;V4.5
   // S7-1510SP (6ES7 510-1DJ01-0AB0)           1;6ES7 510-1DJ01-0AB0;V2.9
   // S7-1507SF (6ES7 672-7FC01-0YA0)           1;6ES7 672-7FC01-0YA0;V21.9
-
+  // PLCSIM Advanced V8.1 (CPU 1500 V4.1)      1;6ES7 SIM-01500-APLC;R4.1
   // Parse device and firmware version
   // Secure PG/HMI communication (TLS) is supported starting with TIA Portal V17:
   //  S7-1500 as of V2.9, S7-1200 as of V4.5, software controllers as of V21.9, SIMATIC Drive controllers as of V2.9,
@@ -56,7 +56,7 @@ export async function legitimate(
   const sessionVersionPAOMString = (
     serverSession.getStructElement(Ids.LID_SessionVersionSystemPAOMString) as ValueWString
   ).getValue();
-  const reVersions = /^[^;]*;[^;]*[17]\s?(\d{3}).*;[VS](\d{1,2}\.\d+)$/i;
+  const reVersions = /^[^;]*;[^;]*[17]\s?(\d{3}).*;[VSR](\d{1,2}\.\d+)$/i;
   const m = reVersions.exec(sessionVersionPAOMString);
   if (m === null) {
     console.log("S7CommPlusConnection - Legitimate: Could not extract firmware version!");
