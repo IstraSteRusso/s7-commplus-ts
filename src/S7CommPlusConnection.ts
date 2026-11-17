@@ -1135,6 +1135,10 @@ export class S7CommPlusConnection {
         return await this.browsePlcTagBySymbol(ioit.getRelationId(), symbol, varInfo);
       }
     } else {
+      // TypeScript addition: a scalar (or a whole array) ends the path. A rest such as ".extra" in
+      // "DB.counter.extra" does not exist; without this check it was ignored and the symbol silently
+      // resolved to "DB.counter".
+      if (symbol.value.length > 0) return null;
       return PlcTags.tagFactory(varInfo.name, new ItemAddress(varInfo.accessSequence), varType.softdatatype, is1Dim);
     }
   }

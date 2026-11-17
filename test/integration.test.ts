@@ -499,6 +499,10 @@ describe("browse", () => {
     expect(await conn.getPlcTagBySymbol("TestDB.doesNotExist")).toBeNull();
     expect(await conn.getPlcTagBySymbol("NoSuchDb.x")).toBeNull();
     await expect(conn.getPlcTagBySymbol("TestDB.samples[9]")).rejects.toThrow("Out of bounds");
+    // nothing may follow a scalar: the rest must not be ignored
+    expect(await conn.getPlcTagBySymbol("TestDB.counter.extra")).toBeNull();
+    expect(await conn.getPlcTagBySymbol("TestDB.samples[2].x")).toBeNull();
+    expect(await conn.getPlcTagBySymbol("TestDB.motor.speed.x")).toBeNull();
     // type info is cached: no further Explore for the already known DB and struct type info
     const before = plc.requests.filter((r) => r.kind === "Explore").length;
     await tag(conn, "TestDB.motor.running");
