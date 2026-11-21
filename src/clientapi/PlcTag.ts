@@ -165,6 +165,75 @@ function fromIsoUtc(text: string): { date: Date; nanosecond: number } {
   return { date, nanosecond: Number(decimals.padEnd(9, "0")) };
 }
 
+/** TypeScript addition: the time zone of the PC, e.g. "Europe/Rome": the default where a time zone can be given */
+function pcTimeZone(): string {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+
+/** TypeScript addition: one Intl formatter per time zone, to read the clock of that zone at any instant */
+const zoneClocks = new Map<string, Intl.DateTimeFormat>();
+
+/** TypeScript addition: how far the clock of a time zone is ahead of UTC at an instant, in ms (3600000 = 1 hour) */
+function zoneOffset(timeZone: string, instant: number): number {
+  let clock = zoneClocks.get(timeZone);
+  if (clock === undefined) {
+    // throws a RangeError for an unknown time zone
+    clock = new Intl.DateTimeFormat("en-US", {
+      timeZone, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric",
+      hour: "numeric", minute: "numeric", second: "numeric",
+    });
+    zoneClocks.set(timeZone, clock);
+  }
+  const field: Record<string, number> = {};
+  for (const part of clock.formatToParts(instant)) field[part.type] = Number(part.value);
+  const clockTime = Date.UTC(field.year, field.month - 1, field.day, field.hour, field.minute, field.second);
+  return clockTime - Math.floor(instant / 1000) * 1000;
+}
+
+/**
+ * TypeScript addition: the instant of PLC digits in a time zone; the digits are in the UTC fields of a Date (see
+ * makeDigits). A time that the zone has twice (end of daylight saving time) gives the first one; a time that the zone
+ * skips (start of daylight saving time) is moved forward by the gap, as "compatible" does in Temporal.
+ */
+function digitsToInstant(digits: Date, timeZone: string): Date {
+  const t = digits.getTime();
+  // the offsets one day before and one day after cover any change of the clock around these digits
+  const candidates = [t - zoneOffset(timeZone, t - 86400000), t - zoneOffset(timeZone, t + 86400000)];
+  const valid = candidates.filter((instant) => instant + zoneOffset(timeZone, instant) === t);
+  return new Date(valid.length > 0 ? Math.min(...valid) : candidates[0]);
+}
+
+/** TypeScript addition: the PLC digits of an instant in a time zone, in the UTC fields of a Date */
+function instantToDigits(instant: Date, timeZone: string): Date {
+  return new Date(instant.getTime() + zoneOffset(timeZone, instant.getTime()));
+}
+
+/**
+ * TypeScript addition: like makeDateTime(), but the digits go in the UTC fields of the Date, where no time zone moves
+ * them. In the local time of the PC, the hour skipped at the start of daylight saving time does not exist (02:30
+ * would become 03:30).
+ */
+function makeDigits(year: number, month: number, day: number, hour: number, minute: number, second: number): Date {
+  makeDateTime(year, month, day, hour, minute, second); // the same checks
+  return new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+}
+
+/** TypeScript addition: the digits as a Date in the local time of the PC, the value of a tag as in C# */
+function digitsToLocal(digits: Date): Date {
+  const local = makeDateTime(
+    digits.getUTCFullYear(), digits.getUTCMonth() + 1, digits.getUTCDate(),
+    digits.getUTCHours(), digits.getUTCMinutes(), digits.getUTCSeconds(),
+  );
+  return addMilliseconds(local, digits.getUTCMilliseconds());
+}
+
+/** TypeScript addition: the digits of a Date in the local time of the PC */
+function localToDigits(local: Date): Date {
+  return new Date(Date.UTC(
+    local.getFullYear(), local.getMonth(), local.getDate(),
+    local.getHours(), local.getMinutes(), local.getSeconds(), local.getMilliseconds(),
+  ));
+}
 
 /** C# array element access: throws IndexOutOfRangeException instead of yielding undefined */
 function byteAt(v: ArrayLike<number>, i: number): number {
@@ -397,6 +466,25 @@ export class PlcTagDate extends PlcTag {
     return new ValueUInt(days & 0xffff);
   }
 
+  /** TypeScript addition: the value as an ISO 8601 date, without time and time zone, e.g. "2026-01-01" */
+  toISOString(): string {
+    const d = this.value;
+    return pad(d.getFullYear(), 4) + "-" + pad(d.getMonth() + 1, 2) + "-" + pad(d.getDate(), 2);
+  }
+
+  /**
+   * TypeScript addition: sets the value from an ISO 8601 date, the format of toISOString(), e.g. "2026-01-01".
+   * Throws a RangeError for other text or for a date outside the Date range.
+   */
+  fromISOString(text: string): void {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+    if (match === null) {
+      throw new RangeError(`"${text}" is not a date like "2026-01-01" (Parameter 'Value')`);
+    }
+    // makeDateTime refuses an impossible date (e.g. February 30); the setter checks the Date range
+    this.value = makeDateTime(+match[1], +match[2], +match[3], 0, 0, 0);
+  }
+
   override toString(): string {
     return PlcTag.resultString(this, dateToShortString(this.value));
   }
@@ -416,7 +504,6 @@ export class PlcTagTimeOfDay extends PlcTag {
       throw new RangeError("Number of milliseconds must be a whole number >= 0 and < 86400000 (Parameter 'Value')");
     }
   }
-
 
   processReadResult(valueObj: unknown, error: bigint): void {
     this.lastReadError = error;
@@ -591,12 +678,14 @@ export class PlcTagDateAndTime extends PlcTag {
    * uuu = milliseconds
    * Q = Weekday 1=Su, 2=Mo, 3=Tu, 4=We, 5=Th, 6=Fr, 7=Sa
    */
-  private _value: Date = new Date(1990, 0, 1);
+  // TypeScript addition: the PLC digits, in the UTC fields of a Date (see makeDigits)
+  private _digits: Date = makeDigits(1990, 1, 1, 0, 0, 0);
 
-  get value(): Date { return this._value; }
+  /** The PLC digits as a Date in the local time of the PC, as in C#. toISOString() can take another time zone */
+  get value(): Date { return digitsToLocal(this._digits); }
   set value(v: Date) {
     if (v.getTime() >= new Date(1990, 0, 1).getTime() && v.getTime() < new Date(2090, 0, 1).getTime()) {
-      this._value = v;
+      this._digits = localToDigits(v);
     } else {
       throw new RangeError("DateTime must be >= 1990-01-01 and < 2090-01-01 (Parameter 'Value')");
     }
@@ -605,6 +694,31 @@ export class PlcTagDateAndTime extends PlcTag {
   constructor(name: string, address: ItemAddress, softdatatype: number) {
     super(name, address, softdatatype);
     this.value = new Date(1990, 0, 1);
+  }
+
+  /**
+   * TypeScript addition: the value as ISO 8601 text in UTC, e.g. "2026-11-21T20:03:10.344Z". The PLC digits are taken
+   * in the given time zone: "UTC" if the program writes them with RD_SYS_T, the zone of the CPU (e.g. "Europe/Rome")
+   * if it writes them with RD_LOC_T. Without it, in the time zone of the PC, like value.
+   */
+  toISOString(timeZone = pcTimeZone()): string {
+    return digitsToInstant(this._digits, timeZone).toISOString();
+  }
+
+  /**
+   * TypeScript addition: sets the value from ISO 8601 text in UTC with 0 to 3 decimals, the format of toISOString(),
+   * as the digits of the given time zone. Throws a RangeError for other text or for a time outside the DT range.
+   */
+  fromISOString(text: string, timeZone = pcTimeZone()): void {
+    const { date, nanosecond } = fromIsoUtc(text);
+    if (nanosecond % 1000000 !== 0) {
+      throw new RangeError(`"${text}" has more than 3 decimals: a DT keeps milliseconds (Parameter 'Value')`);
+    }
+    const digits = instantToDigits(addMilliseconds(date, nanosecond / 1000000), timeZone);
+    if (digits.getTime() < Date.UTC(1990, 0, 1) || digits.getTime() >= Date.UTC(2090, 0, 1)) {
+      throw new RangeError("DateTime must be >= 1990-01-01 and < 2090-01-01 (Parameter 'Value')");
+    }
+    this._digits = digits;
   }
 
   processReadResult(valueObj: unknown, error: bigint): void {
@@ -625,8 +739,8 @@ export class PlcTagDateAndTime extends PlcTag {
       } else {
         year = 2000 + ts[0];
       }
-      this.value = makeDateTime(year, ts[1], ts[2], ts[3], ts[4], ts[5]);
-      this.value = addMilliseconds(this.value, ts[6] * 10 + ts[7]);
+      this._digits = makeDigits(year, ts[1], ts[2], ts[3], ts[4], ts[5]);
+      this._digits = addMilliseconds(this._digits, ts[6] * 10 + ts[7]);
 
       this.quality = PlcTagQC.TAG_QUALITY_GOOD;
     } else {
@@ -637,23 +751,22 @@ export class PlcTagDateAndTime extends PlcTag {
   getWriteValue(): PValue {
     const ts: number[] = new Array(8).fill(0);
     const b = new Uint8Array(8);
-    const value = this.value;
-    if (value.getFullYear() < 2000) {
+    const value = this._digits;
+    if (value.getUTCFullYear() < 2000) {
       // 90-99 = 1990-1999
-      ts[0] = value.getFullYear() - 1900;
+      ts[0] = value.getUTCFullYear() - 1900;
     } else {
       // 00-89 = 2000-2089
-      ts[0] = value.getFullYear() - 2000;
+      ts[0] = value.getUTCFullYear() - 2000;
     }
-    ts[1] = value.getMonth() + 1;
-    ts[2] = value.getDate();
-    ts[3] = value.getHours();
-    ts[4] = value.getMinutes();
-    ts[5] = value.getSeconds();
-    ts[6] = Math.trunc(value.getMilliseconds() / 10);
+    ts[1] = value.getUTCMonth() + 1;
+    ts[2] = value.getUTCDate();
+    ts[3] = value.getUTCHours();
+    ts[4] = value.getUTCMinutes();
+    ts[5] = value.getUTCSeconds();
+    ts[6] = Math.trunc(value.getUTCMilliseconds() / 10);
     // TypeScript addition: the weekday (1 = Sunday ... 7 = Saturday), which the C# driver leaves at 0
-    ts[7] = ((value.getMilliseconds() % 10) << 4) | (value.getDay() + 1);
-
+    ts[7] = ((value.getUTCMilliseconds() % 10) << 4) | (value.getUTCDay() + 1);
     for (let i = 0; i < 7; i++) {
       b[i] = PlcTag["intToBcdByte"](ts[i]);
     }
@@ -943,7 +1056,6 @@ export class PlcTagLTOD extends PlcTag {
     } else {
       throw new RangeError("Number of nanoseconds must be >= 0 and < 86400000000000 (Parameter 'Value')");
     }
-
   }
 
   processReadResult(valueObj: unknown, error: bigint): void {
@@ -988,46 +1100,41 @@ export class PlcTagLDT extends PlcTagSimple<bigint> {
 
   /**
    * TypeScript addition: the value as ISO 8601 text in UTC with the nanoseconds, like PlcTagDTL.toISOString(). The
-   * value counts the PLC digits (without time zone) in ns since 1970-01-01; as for DT and DTL, they are taken in the
-   * time zone of the PC.
+   * value counts the PLC digits (without time zone) in ns since 1970-01-01; they are taken in the given time zone, as
+   * in PlcTagDateAndTime.toISOString(); without it, in the time zone of the PC.
    */
-  toISOString(): string {
+  toISOString(timeZone = pcTimeZone()): string {
     const digits = new Date(Number(this.value / 1000000000n) * 1000); // the PLC digits, in the UTC fields
-    const local = new Date(
-      digits.getUTCFullYear(), digits.getUTCMonth(), digits.getUTCDate(),
-      digits.getUTCHours(), digits.getUTCMinutes(), digits.getUTCSeconds(),
-    );
-    return toIsoUtc(local, this.value % 1000000000n);
+    return toIsoUtc(digitsToInstant(digits, timeZone), this.value % 1000000000n);
   }
 
   /**
-   * TypeScript addition: sets the value from ISO 8601 text in UTC, like PlcTagDTL.fromISOString(). Throws a
-   * RangeError for other text or for a time outside the LDT range (1970-01-01 to 2262-04-11 23:47:16.854775807).
+   * TypeScript addition: sets the value from ISO 8601 text in UTC, like PlcTagDTL.fromISOString(), as the digits of
+   * the given time zone. Throws a RangeError for other text or for a time outside the LDT range (1970-01-01 to
+   * 2262-04-11 23:47:16.854775807).
    */
-  fromISOString(text: string): void {
+  fromISOString(text: string, timeZone = pcTimeZone()): void {
     const { date, nanosecond } = fromIsoUtc(text);
-    // the digits in the time zone of the PC, counted in seconds since 1970-01-01
-    const seconds = Date.UTC(
-      date.getFullYear(), date.getMonth(), date.getDate(),
-      date.getHours(), date.getMinutes(), date.getSeconds(),
-    ) / 1000;
+    // the digits in the time zone, counted in seconds since 1970-01-01
+    const seconds = instantToDigits(date, timeZone).getTime() / 1000;
     const value = BigInt(seconds) * 1000000000n + BigInt(nanosecond);
     if (value < 0n || value > 9223372036854775807n) {
       throw new RangeError("LDT must be >= 1970-01-01 and <= 2262-04-11 23:47:16.854775807 (Parameter 'Value')");
     }
     this.value = value;
   }
-
 }
 
 export class PlcTagDTL extends PlcTag {
-  private _value: Date = new Date(1970, 0, 1);
+  // TypeScript addition: the PLC digits, in the UTC fields of a Date (see makeDigits)
+  private _digits: Date = makeDigits(1970, 1, 1, 0, 0, 0);
   private _valueNanosecond = 0;
 
-  get value(): Date { return this._value; }
+  /** The PLC digits as a Date in the local time of the PC, as in C#. toISOString() can take another time zone */
+  get value(): Date { return digitsToLocal(this._digits); }
   set value(v: Date) {
     if (v.getTime() >= new Date(1970, 0, 1).getTime() && v.getTime() <= new Date(2262, 3, 11, 23, 47, 16).getTime()) {
-      this._value = v;
+      this._digits = localToDigits(v);
     } else {
       throw new RangeError("DateTime must be >= 1970-01-01 and <= 2262-04-11 23:47:16 (Parameter 'Value')");
     }
@@ -1076,7 +1183,7 @@ export class PlcTagDTL extends PlcTag {
           const barr: ArrayLike<number> = elem.getValue();
           const year = barr[0] * 256 + barr[1];
           this.valueNanosecond = ((barr[8] * 16777216 + barr[9] * 65536 + barr[10] * 256 + barr[11]) >>> 0);
-          this.value = makeDateTime(year, barr[2], barr[3], barr[5], barr[6], barr[7]);
+          this._digits = makeDigits(year, barr[2], barr[3], barr[5], barr[6], barr[7]);
           this.quality = PlcTagQC.TAG_QUALITY_GOOD;
         } else {
           this.quality = PlcTagQC.TAG_QUALITY_BAD;
@@ -1093,15 +1200,15 @@ export class PlcTagDTL extends PlcTag {
     const structVal: any = new ValueStruct(0x02000043); // 0x02000043 = TI_LIB.SimpleType.67 -> DTL Systemdatatype
     structVal.packedStructInterfaceTimestamp = this.dtlInterfaceTimestamp;
     const barr = new Uint8Array(12);
-    const year = this.value.getFullYear();
+    const year = this._digits.getUTCFullYear();
     barr[0] = (year >> 8) & 0xff;
     barr[1] = year & 0xff;
-    barr[2] = this.value.getMonth() + 1;
-    barr[3] = this.value.getDate();
-    barr[4] = this.value.getDay() + 1; // TypeScript addition: the weekday (1 = Sunday), which C# leaves at 0
-    barr[5] = this.value.getHours();
-    barr[6] = this.value.getMinutes();
-    barr[7] = this.value.getSeconds();
+    barr[2] = this._digits.getUTCMonth() + 1;
+    barr[3] = this._digits.getUTCDate();
+    barr[4] = this._digits.getUTCDay() + 1; // TypeScript addition: the weekday (1 = Sunday), which C# leaves at 0
+    barr[5] = this._digits.getUTCHours();
+    barr[6] = this._digits.getUTCMinutes();
+    barr[7] = this._digits.getUTCSeconds();
     barr[8] = (this.valueNanosecond >>> 24) & 0xff;
     barr[9] = (this.valueNanosecond >>> 16) & 0xff;
     barr[10] = (this.valueNanosecond >>> 8) & 0xff;
@@ -1112,23 +1219,26 @@ export class PlcTagDTL extends PlcTag {
 
   /**
    * TypeScript addition: the value as ISO 8601 text in UTC, with all the nanoseconds, e.g.
-   * "2026-11-21T10:14:43.755616051Z" (Date.toISOString() stops at the milliseconds). As for the Date of this tag,
-   * the PLC digits are taken in the time zone of the PC.
+   * "2026-11-21T10:14:43.755616051Z" (Date.toISOString() stops at the milliseconds). The PLC digits are taken in the
+   * given time zone, as in PlcTagDateAndTime.toISOString(); without it, in the time zone of the PC.
    */
-  toISOString(): string {
-    return toIsoUtc(this.value, this.valueNanosecond);
+  toISOString(timeZone = pcTimeZone()): string {
+    return toIsoUtc(digitsToInstant(this._digits, timeZone), this.valueNanosecond);
   }
 
   /**
    * TypeScript addition: sets the value from ISO 8601 text in UTC with 0 to 9 decimals, the format of toISOString(),
-   * e.g. "2026-11-21T10:14:43.755616051Z". Throws a RangeError for other text or for a time outside the DTL range.
+   * as the digits of the given time zone. Throws a RangeError for other text or for a time outside the DTL range.
    */
-  fromISOString(text: string): void {
+  fromISOString(text: string, timeZone = pcTimeZone()): void {
     const { date, nanosecond } = fromIsoUtc(text);
-    this.value = date; // the setter checks the DTL range
+    const digits = instantToDigits(date, timeZone);
+    if (digits.getTime() < Date.UTC(1970, 0, 1) || digits.getTime() > Date.UTC(2262, 3, 11, 23, 47, 16)) {
+      throw new RangeError("DateTime must be >= 1970-01-01 and <= 2262-04-11 23:47:16 (Parameter 'Value')");
+    }
+    this._digits = digits;
     this.valueNanosecond = nanosecond;
   }
-
 
   override toString(): string {
     let width: number;
@@ -1244,9 +1354,11 @@ export class PlcTagDateAndTimeArray extends PlcTag {
    * uuu = milliseconds
    * Q = Weekday 1=Su, 2=Mo, 3=Tu, 4=We, 5=Th, 6=Fr, 7=Sa
    */
-  private _value: Date[] = [];
+  // TypeScript addition: the PLC digits of each element, in the UTC fields of a Date (see makeDigits)
+  private _digits: Date[] = [];
 
-  get value(): Date[] { return this._value; }
+  /** The PLC digits as Dates in the local time of the PC, as in C#. toISOStrings() can take another time zone */
+  get value(): Date[] { return this._digits.map(digitsToLocal); }
   set value(v: Date[]) {
     let dataOk = true;
     for (const item of v) {
@@ -1257,7 +1369,7 @@ export class PlcTagDateAndTimeArray extends PlcTag {
       }
     }
     if (dataOk) {
-      this._value = v;
+      this._digits = v.map(localToDigits);
     } else {
       throw new RangeError("DateTime must be >= 1990-01-01 and < 2090-01-01 (Parameter 'Value')");
     }
@@ -1266,6 +1378,14 @@ export class PlcTagDateAndTimeArray extends PlcTag {
   constructor(name: string, address: ItemAddress, softdatatype: number) {
     super(name, address, softdatatype);
     this.value = [];
+  }
+
+  /**
+   * TypeScript addition: each element as ISO 8601 text in UTC, e.g. "2026-11-21T20:03:10.344Z". The PLC digits are
+   * taken in the given time zone, as in PlcTagDateAndTime.toISOString(); without it, in the time zone of the PC.
+   */
+  toISOStrings(timeZone = pcTimeZone()): string[] {
+    return this._digits.map((digits) => digitsToInstant(digits, timeZone).toISOString());
   }
 
   processReadResult(valueObj: unknown, error: bigint): void {
@@ -1289,12 +1409,12 @@ export class PlcTagDateAndTimeArray extends PlcTag {
         } else {
           year = 2000 + ts[0];
         }
-        let value = makeDateTime(year, ts[1], ts[2], ts[3], ts[4], ts[5]);
+        let value = makeDigits(year, ts[1], ts[2], ts[3], ts[4], ts[5]);
         value = addMilliseconds(value, ts[6] * 10 + ts[7]);
         dateTimes.push(value);
         pos += 8;
       } while (pos < v.length);
-      this.value = dateTimes;
+      this._digits = dateTimes;
       this.quality = PlcTagQC.TAG_QUALITY_GOOD;
     } else {
       this.quality = PlcTagQC.TAG_QUALITY_BAD;
@@ -1303,25 +1423,24 @@ export class PlcTagDateAndTimeArray extends PlcTag {
 
   getWriteValue(): PValue {
     const byteStrings: number[] = [];
-    for (const item of this.value) {
+    for (const item of this._digits) {
       const ts: number[] = new Array(8).fill(0);
       const b = new Uint8Array(8);
-      if (item.getFullYear() < 2000) {
+      if (item.getUTCFullYear() < 2000) {
         // 90-99 = 1990-1999
-        ts[0] = item.getFullYear() - 1900;
+        ts[0] = item.getUTCFullYear() - 1900;
       } else {
         // 00-89 = 2000-2089
-        ts[0] = item.getFullYear() - 2000;
+        ts[0] = item.getUTCFullYear() - 2000;
       }
-      ts[1] = item.getMonth() + 1;
-      ts[2] = item.getDate();
-      ts[3] = item.getHours();
-      ts[4] = item.getMinutes();
-      ts[5] = item.getSeconds();
-      ts[6] = Math.trunc(item.getMilliseconds() / 10);
+      ts[1] = item.getUTCMonth() + 1;
+      ts[2] = item.getUTCDate();
+      ts[3] = item.getUTCHours();
+      ts[4] = item.getUTCMinutes();
+      ts[5] = item.getUTCSeconds();
+      ts[6] = Math.trunc(item.getUTCMilliseconds() / 10);
       // TypeScript addition: the weekday (1 = Sunday ... 7 = Saturday), which the C# driver leaves at 0
-      ts[7] = ((item.getMilliseconds() % 10) << 4) | (item.getDay() + 1);
-
+      ts[7] = ((item.getUTCMilliseconds() % 10) << 4) | (item.getUTCDay() + 1);
       for (let i = 0; i < 7; i++) {
         b[i] = PlcTag["intToBcdByte"](ts[i]);
       }

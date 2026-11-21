@@ -36,6 +36,7 @@ const KNOWN_DEVIATIONS: { re: RegExp; reason: string }[] = [
     reason: "Uninitialised string tags: C# Value is null (GetWriteValue throws), the port initialises string tags with \"\"/[].",
   },
 ];
+
 /**
  * Documented deviation: the port writes the weekday of DT, DTL and DT arrays, which C# leaves at 0. Their GetWriteValue
  * results are compared with the weekday set back to 0, so all the other bytes are still checked.
@@ -48,6 +49,7 @@ function zeroWeekday(cls: string | null, ret: any): void {
     ret.getStructElement(0x02000043).getValue()[4] = 0; // the WEEKDAY byte of the DTL
   }
 }
+
 // ---------------------------------------------------------------------------------------------------------------------
 const hex = (b: ArrayLike<number> | null | undefined): string | null =>
   b == null ? null : Array.from(b as ArrayLike<number>, (x) => (x & 0xff).toString(16).padStart(2, "0")).join("");

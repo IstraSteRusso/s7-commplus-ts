@@ -166,7 +166,6 @@ describe("S5Time", () => {
       expect(() => (t.value = ms)).toThrow(RangeError);
     }
   });
-
 });
 
 describe("Date types", () => {
@@ -185,6 +184,32 @@ describe("Date types", () => {
     expect(() => (t.value = new Date(2169, 5, 7))).toThrow(RangeError);
   });
 
+  it("Date as ISO text, without time and time zone", () => {
+    // the same date in any time zone of the PC; in Santiago 2026-09-06 has no midnight (the clock jumps to 01:00)
+    for (const tz of ["Europe/Rome", "America/New_York", "America/Santiago", "UTC"]) {
+      inTimeZone(tz, () => {
+        const t = new PlcTagDate("t", addr(), dt);
+        t.processReadResult(new ValueUInt(13149), 0n); // D#2026-01-01: 13149 days after 1990-01-01
+        expect(t.toISOString()).toBe("2026-01-01");
+        t.fromISOString("2024-01-03");
+        expect((t.getWriteValue() as any).getValue()).toBe(12420);
+        t.fromISOString("2026-09-06");
+        expect((t.getWriteValue() as any).getValue()).toBe(13397);
+        expect(t.toISOString()).toBe("2026-09-06");
+      });
+    }
+  });
+
+  it("Date refuses text that is not a date in its range", () => {
+    const t = new PlcTagDate("t", addr(), dt);
+    t.fromISOString("1990-01-01"); // the first Date
+    t.fromISOString("2169-06-06"); // the last Date
+    const texts = ["abc", "2026-1-1", "01-01-2026", "2026-01-01T00:00:00Z", "2026-02-30", "1989-12-31", "2169-06-07"];
+    for (const text of texts) {
+      expect(() => t.fromISOString(text)).toThrow(RangeError);
+    }
+  });
+
   it("DateAndTime keeps millisecond precision", () => {
     for (const d of [new Date(1990, 0, 1), new Date(2023, 11, 23, 1, 2, 3, 123), new Date(2089, 11, 31, 23, 59, 59, 999), new Date(2000, 0, 1, 0, 0, 0, 7)]) {
       const src = new PlcTagDateAndTime("t", addr(), dt);
@@ -199,6 +224,57 @@ describe("Date types", () => {
     // the last byte: the last digit of the milliseconds (3) and the weekday (7 = Saturday)
     expect(Array.from((t.getWriteValue() as ValueUSIntArray).getValue())).toEqual([0x23, 0x12, 0x23, 0x01, 0x02, 0x03, 0x12, 0x37]);
     expect(() => (t.value = new Date(2090, 0, 1))).toThrow(RangeError);
+  });
+
+  it("DateAndTime as ISO text in a time zone", () => {
+    inTimeZone("Europe/Rome", () => {
+      const t = new PlcTagDateAndTime("t", addr(), dt);
+      const read = (bytes: number[]) => t.processReadResult(new ValueUSIntArray(new Uint8Array(bytes)), 0n);
+      // DT#2026-11-21-21:03:10.344 as the PLC sends it (BCD); the last byte: 4 (milliseconds) and 7 (Saturday)
+      read([0x26, 0x11, 0x21, 0x21, 0x03, 0x10, 0x34, 0x47]);
+      expect(t.toISOString("Europe/Rome")).toBe("2026-11-21T20:03:10.344Z"); // a PLC with RD_LOC_T
+      expect(t.toISOString("UTC")).toBe("2026-11-21T21:03:10.344Z"); // a PLC with RD_SYS_T
+      expect(t.toISOString()).toBe("2026-11-21T20:03:10.344Z"); // no time zone: the one of the PC
+      // 02:30 on 2026-10-25 comes twice in Rome: the first one is taken
+      read([0x26, 0x10, 0x25, 0x02, 0x30, 0x00, 0x00, 0x01]);
+      expect(t.toISOString("Europe/Rome")).toBe("2026-10-25T00:30:00.000Z");
+      // 02:30 on 2026-03-29 does not exist in Rome, but it does in UTC: the digits must not move
+      read([0x26, 0x03, 0x29, 0x02, 0x30, 0x00, 0x00, 0x01]);
+      expect(t.toISOString("UTC")).toBe("2026-03-29T02:30:00.000Z");
+    });
+  });
+
+  it("DateAndTime from ISO text in a time zone", () => {
+    inTimeZone("Europe/Rome", () => {
+      const t = new PlcTagDateAndTime("t", addr(), dt);
+      const bytes = () => Array.from((t.getWriteValue() as ValueUSIntArray).getValue());
+      t.fromISOString("2026-11-21T20:03:10.344Z", "Europe/Rome");
+      expect(bytes()).toEqual([0x26, 0x11, 0x21, 0x21, 0x03, 0x10, 0x34, 0x47]); // 21:03 in Rome
+      t.fromISOString("2026-11-21T20:03:10.344Z", "UTC");
+      expect(bytes()).toEqual([0x26, 0x11, 0x21, 0x20, 0x03, 0x10, 0x34, 0x47]); // 20:03 in UTC
+      // the weekday of the digits: Saturday 23:30 in UTC is already Sunday 00:30 in Rome
+      t.fromISOString("2026-11-21T23:30:00Z", "UTC");
+      expect(bytes()[7]).toBe(0x07);
+      t.fromISOString("2026-11-21T23:30:00Z", "Europe/Rome");
+      expect(bytes()[7]).toBe(0x01);
+      // 02:30 on 2026-03-29 does not exist in Rome, but it does in UTC
+      t.fromISOString("2026-03-29T02:30:00Z", "UTC");
+      expect(bytes().slice(0, 4)).toEqual([0x26, 0x03, 0x29, 0x02]);
+    });
+  });
+
+  it("DateAndTime refuses text that is not a valid UTC time in its range", () => {
+    const t = new PlcTagDateAndTime("t", addr(), dt);
+    t.fromISOString("1990-01-01T00:00:00Z", "UTC"); // the first DT
+    t.fromISOString("2089-12-31T23:59:59.999Z", "UTC"); // the last DT
+    const texts = [
+      "abc", "2026-11-21T20:03:10", "2026-11-21T20:03:10.3441Z", "2026-02-30T10:00:00Z",
+      "1989-12-31T23:59:59.999Z", "2090-01-01T00:00:00Z",
+    ];
+    for (const text of texts) {
+      expect(() => t.fromISOString(text, "UTC")).toThrow(RangeError);
+    }
+    expect(() => t.toISOString("Rome")).toThrow(RangeError); // not a time zone
   });
 
   it("TimeOfDay string and range", () => {
@@ -222,7 +298,6 @@ describe("Date types", () => {
       expect(() => (t.value = v)).toThrow(RangeError);
     }
   });
-
 
   it("DTL round trips date and nanoseconds", () => {
     const cases: Array<[Date, number]> = [
@@ -289,6 +364,26 @@ describe("Date types", () => {
     }
   });
 
+  it("DTL in a time zone", () => {
+    inTimeZone("Europe/Rome", () => {
+      const t = new PlcTagDTL("t", addr(), dt);
+      // DTL#2026-03-29-02:30:00.000000005: an hour that does not exist in Rome, but does in UTC
+      const s = new ValueStruct(0x02000043);
+      s.addStructElement(0x02000043, new ValueByteArray(new Uint8Array([0x07, 0xea, 3, 29, 1, 2, 30, 0, 0, 0, 0, 5])));
+      t.processReadResult(s, 0n);
+      expect(t.toISOString("UTC")).toBe("2026-03-29T02:30:00.000000005Z"); // the digits do not move
+      expect(t.toISOString("America/New_York")).toBe("2026-03-29T06:30:00.000000005Z"); // UTC-4 in summer
+      // the same instant gives the digits of each time zone, and the weekday of those digits
+      const bytes = () => Array.from((t.getWriteValue() as any).getStructElement(0x02000043).getValue());
+      t.fromISOString("2026-11-21T23:30:00.5Z", "UTC");
+      expect(bytes()).toEqual([0x07, 0xea, 11, 21, 7, 23, 30, 0, 0x1d, 0xcd, 0x65, 0x00]); // Saturday 23:30
+      t.fromISOString("2026-11-21T23:30:00.5Z", "Europe/Rome");
+      expect(bytes()).toEqual([0x07, 0xea, 11, 22, 1, 0, 30, 0, 0x1d, 0xcd, 0x65, 0x00]); // Sunday 00:30
+      // the range is checked on the digits: 1970-01-01 00:00 in Rome is still 1969 in UTC
+      t.fromISOString("1969-12-31T23:00:00Z", "Europe/Rome");
+      expect(() => t.fromISOString("1969-12-31T23:00:00Z", "UTC")).toThrow(RangeError);
+    });
+  });
 
   it("DTL rejects a struct with the wrong id", () => {
     const t = new PlcTagDTL("t", addr(), dt);
@@ -322,6 +417,26 @@ describe("Date types", () => {
       for (const text of ["abc", "2026-02-30T10:00:00Z", "1969-12-31T22:59:59Z", "2262-04-11T21:47:16.854775808Z"]) {
         expect(() => t.fromISOString(text)).toThrow(RangeError);
       }
+    });
+  });
+
+  it("LDT in a time zone", () => {
+    inTimeZone("Europe/Rome", () => {
+      const t = new PlcTagLDT("t", addr(), dt);
+      // LDT#2026-03-29-02:30:00.000000005: an hour that does not exist in Rome, but does in UTC
+      const plc = BigInt(Date.UTC(2026, 2, 29, 2, 30) / 1000) * 1000000000n + 5n;
+      t.value = plc;
+      expect(t.toISOString("UTC")).toBe("2026-03-29T02:30:00.000000005Z"); // the digits do not move
+      expect(t.toISOString("America/New_York")).toBe("2026-03-29T06:30:00.000000005Z"); // UTC-4 in summer
+      // and back: the same digits
+      t.fromISOString("2026-03-29T02:30:00.000000005Z", "UTC");
+      expect(t.value).toBe(plc);
+      t.fromISOString("2026-03-29T06:30:00.000000005Z", "America/New_York");
+      expect(t.value).toBe(plc);
+      // the range is checked on the digits: 1970-01-01 00:00 in Rome is still 1969 in UTC
+      t.fromISOString("1969-12-31T23:00:00Z", "Europe/Rome");
+      expect(t.value).toBe(0n);
+      expect(() => t.fromISOString("1969-12-31T23:00:00Z", "UTC")).toThrow(RangeError);
     });
   });
 });
@@ -418,7 +533,19 @@ describe("Array PlcTags", () => {
     // the weekday in the low nibble of the last byte of each DT (1 = Sunday): Monday, Saturday, Saturday
     const bytes = (src.getWriteValue() as ValueUSIntArray).getValue();
     expect([bytes[7] & 0x0f, bytes[15] & 0x0f, bytes[23] & 0x0f]).toEqual([2, 7, 7]);
+  });
 
+  it("DateAndTime array in a time zone", () => {
+    inTimeZone("Europe/Rome", () => {
+      const t = new PlcTagDateAndTimeArray("t", addr(), dt);
+      // two DTs as the PLC sends them: 2026-11-21 21:03:10.344 and 2026-03-29 02:30, an hour that Rome skips
+      const plc = [0x26, 0x11, 0x21, 0x21, 0x03, 0x10, 0x34, 0x47, 0x26, 0x03, 0x29, 0x02, 0x30, 0x00, 0x00, 0x01];
+      t.processReadResult(new ValueUSIntArray(new Uint8Array(plc)), 0n);
+      expect(t.toISOStrings("UTC")).toEqual(["2026-11-21T21:03:10.344Z", "2026-03-29T02:30:00.000Z"]);
+      expect(t.toISOStrings("Europe/Rome")[0]).toBe("2026-11-21T20:03:10.344Z");
+      // written back, the digits do not move
+      expect(Array.from((t.getWriteValue() as ValueUSIntArray).getValue())).toEqual(plc);
+    });
   });
 
   it("String array", () => {
