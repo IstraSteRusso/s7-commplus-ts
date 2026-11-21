@@ -426,7 +426,10 @@ export class PlcConnection {
         for (let p = 0; p < data.length; p += seg) {
           if (this.closed) return;
           await new Promise<void>((resolve) => this.socket.write(data.subarray(p, p + seg), () => resolve()));
-          await sleep(2);
+          // one turn of the event loop, so that each piece goes out on its own (a timer would be too slow on Windows,
+          // where setTimeout(2) lasts about 15 ms: a big answer would take longer than the read timeout of the client)
+          await new Promise<void>((resolve) => setImmediate(resolve));
+
         }
       } else {
         await new Promise<void>((resolve) => this.socket.write(data, () => resolve()));
