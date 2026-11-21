@@ -46,3 +46,5 @@ vector count can vary by a few between runs. `GOLDEN_REPORT=<file>` makes the te
   `double.NaN` bit pattern.
 * Deserialize methods return the number of consumed bytes as `position - start` (documented in `PORTING.md`); the
   C# return values are not compared, the stream position is.
+* DT, DTL and DT arrays are written with their weekday (C# leaves it at 0): their `GetWriteValue` results are compared
+  with the weekday set back to 0.

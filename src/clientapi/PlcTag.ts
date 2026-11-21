@@ -651,7 +651,9 @@ export class PlcTagDateAndTime extends PlcTag {
     ts[4] = value.getMinutes();
     ts[5] = value.getSeconds();
     ts[6] = Math.trunc(value.getMilliseconds() / 10);
-    ts[7] = (value.getMilliseconds() % 10) << 4; // Don't set the weekday
+    // TypeScript addition: the weekday (1 = Sunday ... 7 = Saturday), which the C# driver leaves at 0
+    ts[7] = ((value.getMilliseconds() % 10) << 4) | (value.getDay() + 1);
+
     for (let i = 0; i < 7; i++) {
       b[i] = PlcTag["intToBcdByte"](ts[i]);
     }
@@ -1096,7 +1098,7 @@ export class PlcTagDTL extends PlcTag {
     barr[1] = year & 0xff;
     barr[2] = this.value.getMonth() + 1;
     barr[3] = this.value.getDate();
-    barr[4] = 0; // Weekday, don't set
+    barr[4] = this.value.getDay() + 1; // TypeScript addition: the weekday (1 = Sunday), which C# leaves at 0
     barr[5] = this.value.getHours();
     barr[6] = this.value.getMinutes();
     barr[7] = this.value.getSeconds();
@@ -1317,7 +1319,9 @@ export class PlcTagDateAndTimeArray extends PlcTag {
       ts[4] = item.getMinutes();
       ts[5] = item.getSeconds();
       ts[6] = Math.trunc(item.getMilliseconds() / 10);
-      ts[7] = (item.getMilliseconds() % 10) << 4; // Don't set the weekday
+      // TypeScript addition: the weekday (1 = Sunday ... 7 = Saturday), which the C# driver leaves at 0
+      ts[7] = ((item.getMilliseconds() % 10) << 4) | (item.getDay() + 1);
+
       for (let i = 0; i < 7; i++) {
         b[i] = PlcTag["intToBcdByte"](ts[i]);
       }

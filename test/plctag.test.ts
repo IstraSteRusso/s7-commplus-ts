@@ -196,7 +196,8 @@ describe("Date types", () => {
   it("DateAndTime BCD layout", () => {
     const t = new PlcTagDateAndTime("t", addr(), dt);
     t.value = new Date(2023, 11, 23, 1, 2, 3, 123);
-    expect(Array.from((t.getWriteValue() as ValueUSIntArray).getValue())).toEqual([0x23, 0x12, 0x23, 0x01, 0x02, 0x03, 0x12, 0x30]);
+    // the last byte: the last digit of the milliseconds (3) and the weekday (7 = Saturday)
+    expect(Array.from((t.getWriteValue() as ValueUSIntArray).getValue())).toEqual([0x23, 0x12, 0x23, 0x01, 0x02, 0x03, 0x12, 0x37]);
     expect(() => (t.value = new Date(2090, 0, 1))).toThrow(RangeError);
   });
 
@@ -267,9 +268,9 @@ describe("Date types", () => {
       const t = new PlcTagDTL("t", addr(), dt);
       t.fromISOString("2026-11-21T10:14:43.755616051Z");
       expect(t.toISOString()).toBe("2026-11-21T10:14:43.755616051Z");
-      // the PLC gets the digits of Rome: 11:14:43 and 755616051 ns (the weekday is not written)
+      // the PLC gets the digits of Rome: 11:14:43 and 755616051 ns, and the weekday (7 = Saturday)
       const bytes = (t.getWriteValue() as any).getStructElement(0x02000043).getValue();
-      expect(Array.from(bytes)).toEqual([0x07, 0xea, 11, 21, 0, 11, 14, 43, 0x2d, 0x09, 0xc9, 0x33]);
+      expect(Array.from(bytes)).toEqual([0x07, 0xea, 11, 21, 7, 11, 14, 43, 0x2d, 0x09, 0xc9, 0x33]);
       t.fromISOString("2026-07-15T09:14:43.5Z"); // fewer decimals
       expect([t.value.getHours(), t.valueNanosecond]).toEqual([11, 500000000]);
       t.fromISOString("2026-07-15T09:14:43Z"); // no decimals
@@ -414,6 +415,10 @@ describe("Array PlcTags", () => {
     src.value = v;
     const dst = roundTrip(src, new PlcTagDateAndTimeArray("t", addr(), dt));
     expect(dst.value.map((d) => d.getTime())).toEqual(v.map((d) => d.getTime()));
+    // the weekday in the low nibble of the last byte of each DT (1 = Sunday): Monday, Saturday, Saturday
+    const bytes = (src.getWriteValue() as ValueUSIntArray).getValue();
+    expect([bytes[7] & 0x0f, bytes[15] & 0x0f, bytes[23] & 0x0f]).toEqual([2, 7, 7]);
+
   });
 
   it("String array", () => {

@@ -36,7 +36,18 @@ const KNOWN_DEVIATIONS: { re: RegExp; reason: string }[] = [
     reason: "Uninitialised string tags: C# Value is null (GetWriteValue throws), the port initialises string tags with \"\"/[].",
   },
 ];
-
+/**
+ * Documented deviation: the port writes the weekday of DT, DTL and DT arrays, which C# leaves at 0. Their GetWriteValue
+ * results are compared with the weekday set back to 0, so all the other bytes are still checked.
+ */
+function zeroWeekday(cls: string | null, ret: any): void {
+  if (cls === "PlcTagDateAndTime" || cls === "PlcTagDateAndTimeArray") {
+    const b: Uint8Array = ret.getValue();
+    for (let i = 7; i < b.length; i += 8) b[i] &= 0xf0; // the low nibble of the last byte of each DT
+  } else if (cls === "PlcTagDTL") {
+    ret.getStructElement(0x02000043).getValue()[4] = 0; // the WEEKDAY byte of the DTL
+  }
+}
 // ---------------------------------------------------------------------------------------------------------------------
 const hex = (b: ArrayLike<number> | null | undefined): string | null =>
   b == null ? null : Array.from(b as ArrayLike<number>, (x) => (x & 0xff).toString(16).padStart(2, "0")).join("");
@@ -248,6 +259,7 @@ function runVector(v: any): string[] {
   v.do.forEach((c: any[], i: number) => {
     const exp = v.expect[i];
     const act = call(inst, cls, c, isStatic);
+    if (c[0] === "GetWriteValue" && act.ret) zeroWeekday(cls, act.ret);
     const p = `${c[0]}`;
     if (exp.err !== undefined) { if (act.err === undefined) errs.push(`${p}: C# threw ${exp.err}, TS did not (result ${show(act.ret ?? act.out ?? act.str)})`); return; }
     if (act.err !== undefined) { errs.push(`${p}: TS threw "${act.err}", C# did not`); return; }
