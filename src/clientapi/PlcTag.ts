@@ -142,6 +142,29 @@ function makeDateTime(year: number, month: number, day: number, hour: number, mi
   d.setFullYear(year); // (the Date constructor maps years 0..99 to 1900..1999)
   return d;
 }
+/** TypeScript addition: a time as ISO 8601 text in UTC with nanoseconds, e.g. "2026-11-21T10:14:43.755616051Z" */
+function toIsoUtc(date: Date, nanosecond: number | bigint): string {
+  return date.toISOString().slice(0, 19) + "." + pad(nanosecond, 9) + "Z";
+}
+
+/**
+ * TypeScript addition: the opposite of toIsoUtc(), with 0 to 9 decimals. Gives the time up to the seconds and the
+ * nanoseconds; throws a RangeError for other text or for an impossible date.
+ */
+function fromIsoUtc(text: string): { date: Date; nanosecond: number } {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/.exec(text);
+  if (match === null) {
+    throw new RangeError(`"${text}" is not a UTC time like "2026-11-21T10:14:43.755616051Z" (Parameter 'Value')`);
+  }
+  const [, year, month, day, hour, minute, second, decimals = ""] = match;
+  const date = new Date(Date.UTC(+year, +month - 1, +day, +hour, +minute, +second));
+  // Date.UTC moves an impossible time (e.g. February 30 or 24:00) to another one: it must come back the same
+  if (date.toISOString().slice(0, 19) !== text.slice(0, 19)) {
+    throw new RangeError(`"${text}" is not a valid date and time (Parameter 'Value')`);
+  }
+  return { date, nanosecond: Number(decimals.padEnd(9, "0")) };
+}
+
 
 /** C# array element access: throws IndexOutOfRangeException instead of yielding undefined */
 function byteAt(v: ArrayLike<number>, i: number): number {
@@ -386,12 +409,14 @@ export class PlcTagTimeOfDay extends PlcTag {
   /** Number of milliseconds since 00:00:00, must be below 86400000ms */
   get value(): number { return this._value; }
   set value(v: number) {
-    if (v < 86400000) {
+    // TypeScript addition: a whole number >= 0 (a number can be negative or have decimals, the C# uint cannot)
+    if (Number.isInteger(v) && v >= 0 && v < 86400000) {
       this._value = v;
     } else {
-      throw new RangeError("Number if milliseconds must be < 86400000 (Parameter 'Value')");
+      throw new RangeError("Number of milliseconds must be a whole number >= 0 and < 86400000 (Parameter 'Value')");
     }
   }
+
 
   processReadResult(valueObj: unknown, error: bigint): void {
     this.lastReadError = error;
@@ -494,6 +519,31 @@ export class PlcTagS5Time extends PlcTag {
     } else {
       throw new RangeError("TimeBase must be >= 0 and <= 3 (Parameter 'Value')");
     }
+  }
+
+  /** Milliseconds of each TimeBase: 0=10ms, 1=100ms, 2=1s, 3=10s */
+  private static readonly TIME_BASE_MS = [10, 100, 1000, 10000];
+
+  /**
+   * TypeScript addition: the value in milliseconds (TimeValue x TimeBase), like PlcTagTime. Writing picks the finest
+   * TimeBase that holds the value exactly; a value that S5Time cannot hold exactly (e.g. 12345ms) throws a RangeError.
+   */
+  get value(): number {
+    return this.timeValue * PlcTagS5Time.TIME_BASE_MS[this.timeBase];
+  }
+  set value(ms: number) {
+    for (let base = 0; base < PlcTagS5Time.TIME_BASE_MS.length; base++) {
+      const timeValue = ms / PlcTagS5Time.TIME_BASE_MS[base];
+      if (Number.isInteger(timeValue) && timeValue >= 0 && timeValue <= 999) {
+        this.timeValue = timeValue;
+        this.timeBase = base;
+        return;
+      }
+    }
+    throw new RangeError(
+      "S5Time must be a whole number of 10ms up to 9990ms, of 100ms up to 99900ms, of 1s up to 999s " +
+        "or of 10s up to 9990s (Parameter 'Value')",
+    );
   }
 
   processReadResult(valueObj: unknown, error: bigint): void {
@@ -885,12 +935,13 @@ export class PlcTagLTOD extends PlcTag {
   /** Number of nanoseconds since 00:00:00, must be below 86400000000000ns */
   get value(): bigint { return this._value; }
   set value(v: bigint) {
-    if (v < 86400000000000n) {
+    // TypeScript addition: >= 0 (a bigint can be negative, the C# ulong cannot)
+    if (v >= 0n && v < 86400000000000n) {
       this._value = v;
     } else {
-      throw new RangeError("Number if nanoseconds must be < 86400000000000 (Parameter 'Value')");
+      throw new RangeError("Number of nanoseconds must be >= 0 and < 86400000000000 (Parameter 'Value')");
     }
-    this._value = v;
+
   }
 
   processReadResult(valueObj: unknown, error: bigint): void {
@@ -932,6 +983,39 @@ export class PlcTagLDT extends PlcTagSimple<bigint> {
   protected fromPValue(v: PValue): bigint { return (v as any).getValue(); }
   protected toPValue(): PValue { return new ValueTimestamp(this.value); }
   protected override valueToString(): string { return ValueTimestamp.toStringValue(this.value); }
+
+  /**
+   * TypeScript addition: the value as ISO 8601 text in UTC with the nanoseconds, like PlcTagDTL.toISOString(). The
+   * value counts the PLC digits (without time zone) in ns since 1970-01-01; as for DT and DTL, they are taken in the
+   * time zone of the PC.
+   */
+  toISOString(): string {
+    const digits = new Date(Number(this.value / 1000000000n) * 1000); // the PLC digits, in the UTC fields
+    const local = new Date(
+      digits.getUTCFullYear(), digits.getUTCMonth(), digits.getUTCDate(),
+      digits.getUTCHours(), digits.getUTCMinutes(), digits.getUTCSeconds(),
+    );
+    return toIsoUtc(local, this.value % 1000000000n);
+  }
+
+  /**
+   * TypeScript addition: sets the value from ISO 8601 text in UTC, like PlcTagDTL.fromISOString(). Throws a
+   * RangeError for other text or for a time outside the LDT range (1970-01-01 to 2262-04-11 23:47:16.854775807).
+   */
+  fromISOString(text: string): void {
+    const { date, nanosecond } = fromIsoUtc(text);
+    // the digits in the time zone of the PC, counted in seconds since 1970-01-01
+    const seconds = Date.UTC(
+      date.getFullYear(), date.getMonth(), date.getDate(),
+      date.getHours(), date.getMinutes(), date.getSeconds(),
+    ) / 1000;
+    const value = BigInt(seconds) * 1000000000n + BigInt(nanosecond);
+    if (value < 0n || value > 9223372036854775807n) {
+      throw new RangeError("LDT must be >= 1970-01-01 and <= 2262-04-11 23:47:16.854775807 (Parameter 'Value')");
+    }
+    this.value = value;
+  }
+
 }
 
 export class PlcTagDTL extends PlcTag {
@@ -1023,6 +1107,26 @@ export class PlcTagDTL extends PlcTag {
     structVal.addStructElement(0x02000043, new ValueByteArray(barr));
     return structVal;
   }
+
+  /**
+   * TypeScript addition: the value as ISO 8601 text in UTC, with all the nanoseconds, e.g.
+   * "2026-11-21T10:14:43.755616051Z" (Date.toISOString() stops at the milliseconds). As for the Date of this tag,
+   * the PLC digits are taken in the time zone of the PC.
+   */
+  toISOString(): string {
+    return toIsoUtc(this.value, this.valueNanosecond);
+  }
+
+  /**
+   * TypeScript addition: sets the value from ISO 8601 text in UTC with 0 to 9 decimals, the format of toISOString(),
+   * e.g. "2026-11-21T10:14:43.755616051Z". Throws a RangeError for other text or for a time outside the DTL range.
+   */
+  fromISOString(text: string): void {
+    const { date, nanosecond } = fromIsoUtc(text);
+    this.value = date; // the setter checks the DTL range
+    this.valueNanosecond = nanosecond;
+  }
+
 
   override toString(): string {
     let width: number;

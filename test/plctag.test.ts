@@ -29,6 +29,18 @@ function roundTrip<T extends PlcTag>(src: T, dst: T): T {
   return dst;
 }
 
+/** Runs fn with the time zone of the PC set to tz (Node applies a new process.env.TZ at once) */
+function inTimeZone(tz: string, fn: () => void): void {
+  const saved = process.env.TZ;
+  process.env.TZ = tz;
+  try {
+    fn();
+  } finally {
+    if (saved === undefined) delete process.env.TZ;
+    else process.env.TZ = saved;
+  }
+}
+
 describe("scalar PlcTags round trip", () => {
   const cases: Array<[string, () => PlcTag & { value: any }, any[]]> = [
     ["Byte", () => new PlcTagByte("t", addr(), dt), [0x00, 0x01, 0x55, 0xaa, 0xff]],
@@ -130,6 +142,31 @@ describe("S5Time", () => {
     expect(() => (t.timeValue = 1000)).toThrow(RangeError);
     expect(() => (t.timeBase = 4)).toThrow(RangeError);
   });
+
+  it("has a value in milliseconds, like Time", () => {
+    const t = new PlcTagS5Time("t", addr(), dt);
+    t.processReadResult(new ValueWord(2457), 0n); // S5T#9S990MS: base 0 (10ms), value 999
+    expect(t.value).toBe(9990);
+    t.processReadResult(new ValueWord(14745), 0n); // S5T#2H46M30S: base 3 (10s), value 999
+    expect(t.value).toBe(9990000);
+    // writing picks the finest time base that holds the value exactly
+    const cases = [[0, 0, 0], [9990, 999, 0], [10000, 100, 1], [12300, 123, 1], [100000, 100, 2], [9990000, 999, 3]];
+    for (const [ms, tv, tb] of cases) {
+      t.value = ms;
+      expect([t.timeValue, t.timeBase]).toEqual([tv, tb]);
+      expect(t.value).toBe(ms);
+    }
+    t.value = 12300;
+    expect((t.getWriteValue() as any).getValue()).toBe(0x1123); // S5T#12S300MS = W#16#1123
+  });
+
+  it("rejects milliseconds that S5Time cannot hold exactly", () => {
+    const t = new PlcTagS5Time("t", addr(), dt);
+    for (const ms of [-10, 5, 12345, 9990001, 10000000, NaN]) {
+      expect(() => (t.value = ms)).toThrow(RangeError);
+    }
+  });
+
 });
 
 describe("Date types", () => {
@@ -175,7 +212,16 @@ describe("Date types", () => {
   it("LTOD range", () => {
     const t = new PlcTagLTOD("t", addr(), dt);
     expect(() => (t.value = 86400000000000n)).toThrow(RangeError);
+    expect(() => (t.value = -1n)).toThrow(RangeError);
   });
+
+  it("TimeOfDay range", () => {
+    const t = new PlcTagTimeOfDay("t", addr(), dt);
+    for (const v of [86400000, -1, 1.5, NaN]) {
+      expect(() => (t.value = v)).toThrow(RangeError);
+    }
+  });
+
 
   it("DTL round trips date and nanoseconds", () => {
     const cases: Array<[Date, number]> = [
@@ -199,12 +245,83 @@ describe("Date types", () => {
     }
   });
 
+  it("DTL as ISO text in UTC, with the nanoseconds", () => {
+    inTimeZone("Europe/Rome", () => {
+      const t = new PlcTagDTL("t", addr(), dt);
+      // DTL#2026-11-21-11:14:43.755616051 as the PLC sends it: year (2 bytes), month, day, weekday (7 = Saturday),
+      // hour, minute, second, nanosecond (4 bytes)
+      const bytes = [0x07, 0xea, 11, 21, 7, 11, 14, 43, 0x2d, 0x09, 0xc9, 0x33];
+      const s = new ValueStruct(0x02000043);
+      s.addStructElement(0x02000043, new ValueByteArray(new Uint8Array(bytes)));
+      t.processReadResult(s, 0n);
+      expect(t.valueNanosecond).toBe(755616051);
+      expect(t.toISOString()).toBe("2026-11-21T10:14:43.755616051Z"); // Rome is UTC+1 in winter
+      t.value = new Date(2026, 6, 15, 11, 14, 43);
+      t.valueNanosecond = 5;
+      expect(t.toISOString()).toBe("2026-07-15T09:14:43.000000005Z"); // and UTC+2 in summer
+    });
+  });
+
+  it("DTL from ISO text in UTC", () => {
+    inTimeZone("Europe/Rome", () => {
+      const t = new PlcTagDTL("t", addr(), dt);
+      t.fromISOString("2026-11-21T10:14:43.755616051Z");
+      expect(t.toISOString()).toBe("2026-11-21T10:14:43.755616051Z");
+      // the PLC gets the digits of Rome: 11:14:43 and 755616051 ns (the weekday is not written)
+      const bytes = (t.getWriteValue() as any).getStructElement(0x02000043).getValue();
+      expect(Array.from(bytes)).toEqual([0x07, 0xea, 11, 21, 0, 11, 14, 43, 0x2d, 0x09, 0xc9, 0x33]);
+      t.fromISOString("2026-07-15T09:14:43.5Z"); // fewer decimals
+      expect([t.value.getHours(), t.valueNanosecond]).toEqual([11, 500000000]);
+      t.fromISOString("2026-07-15T09:14:43Z"); // no decimals
+      expect(t.valueNanosecond).toBe(0);
+    });
+  });
+
+  it("DTL refuses text that is not a valid UTC time in its range", () => {
+    const t = new PlcTagDTL("t", addr(), dt);
+    const texts = [
+      "abc", "2026-11-21 10:14:43Z", "2026-11-21T10:14:43", "2026-11-21T10:14:43+01:00", "2026-11-21T10:14:43.1234567890Z",
+      "2026-02-30T10:00:00Z", "2026-11-21T24:00:00Z", "1969-12-31T00:00:00Z", "2262-04-13T00:00:00Z",
+    ];
+    for (const text of texts) {
+      expect(() => t.fromISOString(text)).toThrow(RangeError);
+    }
+  });
+
+
   it("DTL rejects a struct with the wrong id", () => {
     const t = new PlcTagDTL("t", addr(), dt);
     const s = new ValueStruct(0x02000044);
     s.addStructElement(0x02000044, new ValueByteArray(new Uint8Array(12)));
     t.processReadResult(s, 0n);
     expect(t.quality).toBe(PlcTagQC.TAG_QUALITY_BAD);
+  });
+
+  it("LDT as ISO text in UTC, and back", () => {
+    inTimeZone("Europe/Rome", () => {
+      const t = new PlcTagLDT("t", addr(), dt);
+      // LDT#2026-11-21-11:14:43.755616051 as the PLC sends it: the digits in ns since 1970-01-01, without time zone
+      const plc = BigInt(Date.UTC(2026, 10, 21, 11, 14, 43) / 1000) * 1000000000n + 755616051n;
+      t.value = plc;
+      expect(t.toISOString()).toBe("2026-11-21T10:14:43.755616051Z"); // Rome is UTC+1 in winter
+      t.fromISOString("2026-07-15T09:14:43.000000005Z"); // and UTC+2 in summer: the PLC gets 11:14:43
+      expect(t.value).toBe(BigInt(Date.UTC(2026, 6, 15, 11, 14, 43) / 1000) * 1000000000n + 5n);
+      t.fromISOString("2026-11-21T10:14:43.755616051Z");
+      expect(t.value).toBe(plc);
+    });
+  });
+
+  it("LDT refuses text that is not a valid UTC time in its range", () => {
+    inTimeZone("Europe/Rome", () => {
+      const t = new PlcTagLDT("t", addr(), dt);
+      t.fromISOString("1969-12-31T23:00:00Z"); // 1970-01-01 00:00 in Rome: the first LDT
+      expect(t.value).toBe(0n);
+      t.fromISOString("2262-04-11T21:47:16.854775807Z"); // 23:47:16.854775807 in Rome (summer): the last LDT
+      expect(t.value).toBe(9223372036854775807n);
+      for (const text of ["abc", "2026-02-30T10:00:00Z", "1969-12-31T22:59:59Z", "2262-04-11T21:47:16.854775808Z"]) {
+        expect(() => t.fromISOString(text)).toThrow(RangeError);
+      }
+    });
   });
 });
 
