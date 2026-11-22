@@ -429,7 +429,6 @@ export class PlcConnection {
           // one turn of the event loop, so that each piece goes out on its own (a timer would be too slow on Windows,
           // where setTimeout(2) lasts about 15 ms: a big answer would take longer than the read timeout of the client)
           await new Promise<void>((resolve) => setImmediate(resolve));
-
         }
       } else {
         await new Promise<void>((resolve) => this.socket.write(data, () => resolve()));
@@ -970,8 +969,9 @@ export class PlcConnection {
       for (const s of this.plc.structs) children.push(this.typeInfoObject(s.tiRelId, s.vars, s.size));
       objs.push(serializeContainer(Ids.ObjectOMSTypeInfoContainer, Ids.ClassOMSTypeInfoContainer, children));
     } else if ([0x90010000, 0x90020000, 0x90030000, 0x90050000, 0x90060000].includes(req.exploreId)) {
-      // I/Q/M/T/C areas: type info without variables
-      objs.push(serializeTypeInfoObject(req.exploreId, 0x0abc, []));
+      // I/Q/M/T/C areas: the PLC tags that a test put in plc.structs, or none
+      const area = this.plc.structs.find((s) => s.tiRelId === req.exploreId);
+      objs.push(area ? this.typeInfoObject(area.tiRelId, area.vars) : serializeTypeInfoObject(req.exploreId, 0x0abc, []));
     } else if (this.plc.dbs.some((d) => d.relId === req.exploreId) && req.attributes.includes(Ids.ASObjectES_Comment)) {
       // comments of a datablock (getCommentsXml): DB comment as WString sparse array, line comments as a zlib compressed
       // XML blob with a 4 byte prefix (BlobDecompressor offset 4)

@@ -21,6 +21,7 @@ import { generateSelfSignedCert } from "./mock-plc/cert.js";
 import { ERR_ADDRESS, ERR_NO_ACCESS, ERR_TYPE, MockPlc } from "./mock-plc/MockPlc.js";
 import type { MockPlcOptions } from "./mock-plc/MockPlc.js";
 import { AlarmBlobArray, buildAlarmNotification, buildCreateObjectResponse, buildGetMultiVariablesResponse, itemKey } from "./mock-plc/messages.js";
+import { STRUCT_TI } from "./mock-plc/model.js";
 
 let plc: MockPlc;
 const conns: S7CommPlusConnection[] = [];
@@ -517,6 +518,73 @@ describe("browse", () => {
     const conn = await connectOk();
     plc.structs.length = 0; // struct type info vanishes => Explore returns an error / no object
     await expect(conn.getPlcTagBySymbol("TestDB.motor.speed")).rejects.toThrow();
+  });
+
+  it("browses the children of a DB, a struct and an array, as getPlcTagBySymbol finds them", async () => {
+    await startPlc();
+    const conn = await connectOk();
+    const db = (await conn.browseChildren("TestDB"))!;
+    expect(db.map((c) => `${c.symbol}:${c.kind}`)).toEqual([
+      "TestDB.flag:value", "TestDB.counter:value", "TestDB.bigNumber:value", "TestDB.temperature:value",
+      "TestDB.name:value", "TestDB.samples:array", "TestDB.motor:struct", "TestDB.word:value", "TestDB.dword:value",
+      "TestDB.lreal:value", "TestDB.lint:value", "TestDB.usint:value", "TestDB.udint:value", "TestDB.shortText:value",
+      "TestDB.bytes:array",
+    ]);
+    expect(db[5]).toMatchObject({
+      name: "samples", softdatatype: Softdatatype.S7COMMP_SOFTDATATYPE_INT, dimensions: [{ lowerBound: 0, count: 4 }],
+    });
+    const motor = (await conn.browseChildren("TestDB.motor"))!;
+    expect(motor.map((c) => `${c.name} ${c.symbol}:${c.kind}`)).toEqual([
+      "speed TestDB.motor.speed:value", "running TestDB.motor.running:value", "mode TestDB.motor.mode:value",
+    ]);
+    const samples = (await conn.browseChildren("TestDB.samples"))!;
+    expect(samples.map((c) => `${c.name} ${c.symbol}:${c.kind}`)).toEqual([
+      "samples[0] TestDB.samples[0]:value", "samples[1] TestDB.samples[1]:value",
+      "samples[2] TestDB.samples[2]:value", "samples[3] TestDB.samples[3]:value",
+    ]);
+    // getPlcTagBySymbol finds every child that is not a struct, whole arrays included
+    for (const child of [...db, ...motor, ...samples].filter((c) => c.kind !== "struct")) {
+      expect(await conn.getPlcTagBySymbol(child.symbol), child.symbol).not.toBeNull();
+    }
+    expect(await conn.browseChildren("TestDB.counter")).toEqual([]); // a value has no children
+    expect(await conn.browseChildren('"TestDB".motor')).toEqual(motor);
+    expect(await conn.browseChildren("TestDB.nothing")).toBeNull();
+    expect(await conn.browseChildren("NoSuchDb")).toBeNull();
+    expect(await conn.browseChildren("TestDB.counter.extra")).toBeNull();
+    await expect(conn.browseChildren("TestDB.samples[4]")).rejects.toThrow("Out of bounds");
+    await expect(conn.browseChildren("TestDB.samples[1,2]")).rejects.toThrow("Out of bounds"); // one index only
+  });
+
+  it("puts in quotes the names that a dot or a bracket would cut", async () => {
+    await startPlc();
+    plc.dbs.push({
+      name: "Line.1", number: 4, relId: 0x8a0e0004, tiRelId: 0x00b00005,
+      vars: [{ name: "a[1]", lid: 0x0a, softdatatype: Softdatatype.S7COMMP_SOFTDATATYPE_DINT, oi: { t: "std", opt: 0, nonopt: 0 } }],
+    });
+    const conn = await connectOk();
+    const children = (await conn.browseChildren('"Line.1"'))!;
+    expect(children.map((c) => c.symbol)).toEqual(['"Line.1"."a[1]"']);
+    expect(await conn.getPlcTagBySymbol(children[0].symbol)).not.toBeNull();
+  });
+
+  it("browses the PLC tags of the inputs, outputs and bit memory", async () => {
+    await startPlc();
+    // the bit memory gets two PLC tags (the fake PLC has none by default), one of them a struct
+    plc.structs.push({
+      tiRelId: 0x90030000, size: 0,
+      vars: [
+        { name: "_dummy", lid: 1, softdatatype: Softdatatype.S7COMMP_SOFTDATATYPE_BOOL, oi: { t: "std", opt: 0, nonopt: 0 } },
+        {
+          name: "Drive", lid: 2, softdatatype: Softdatatype.S7COMMP_SOFTDATATYPE_STRUCT,
+          oi: { t: "struct", relationId: STRUCT_TI, opt: 2, nonopt: 2 },
+        },
+      ],
+    });
+    const conn = await connectOk();
+    expect((await conn.browseArea("M")).map((c) => `${c.symbol}:${c.kind}`)).toEqual(["_dummy:value", "Drive:struct"]);
+    expect(await conn.browseArea("I")).toEqual([]); // no PLC tags in the inputs
+    expect((await conn.browseChildren("Drive"))!.map((c) => c.symbol)).toEqual(["Drive.speed", "Drive.running", "Drive.mode"]);
+    expect(await conn.getPlcTagBySymbol("Drive.speed")).not.toBeNull();
   });
 });
 

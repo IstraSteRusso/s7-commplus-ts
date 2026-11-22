@@ -87,6 +87,73 @@ export class DatablockInfo {
   db_block_ti_relid = 0; // Type-Info RID of the datablock
 }
 
+/** TypeScript addition: one child given by browseChildren() or browseArea(), to show the PLC program as a tree */
+export class BrowseChild {
+  /** The name of this level, e.g. "speed", "samples" or, for an array element, "samples[2]" */
+  name = "";
+  /** The full name in the format of getPlcTagBySymbol(), e.g. "TestDB.motor.speed" */
+  symbol = "";
+  softdatatype = 0;
+  /** "struct" and "array" have children (see browseChildren()); "value" is a tag to read, a DTL included */
+  kind: "struct" | "array" | "value" = "value";
+  /** For an array: the lower bound and the number of elements of each dimension, in the order of TIA Portal */
+  dimensions: { lowerBound: number; count: number }[] = [];
+}
+
+/** TypeScript addition: a name as one level of a symbol, in quotes when a "." or a "[" would cut it (parseSymbolLevel) */
+function symbolLevel(name: string): string {
+  return /[.[]/.test(name) ? `"${name}"` : name;
+}
+
+/** TypeScript addition: the dimensions of an array variable, in the order of TIA Portal; none for other variables */
+function arrayDimensions(varType: PVartypeListElement): { lowerBound: number; count: number }[] {
+  const oit = varType.offsetInfoType!;
+  if (oit.is1Dim()) {
+    const array = oit as unknown as IOffsetInfoType_1Dim;
+    return [{ lowerBound: array.getArrayLowerBounds(), count: array.getArrayElementCount() }];
+  }
+  if (oit.isMDim()) {
+    const array = oit as unknown as IOffsetInfoType_MDim;
+    const counts = [...array.getMdimArrayElementCount()];
+    const lowerBounds = array.getMdimArrayLowerBounds() as unknown as number[];
+    const dimCount = counts.reduce((acc, act) => acc + (act > 0 ? 1 : 0), 0);
+    // the PLC gives the last dimension of TIA Portal first (see calcAccessSeqForMDimArray)
+    return Array.from({ length: dimCount }, (_, i) => ({
+      lowerBound: lowerBounds[dimCount - i - 1],
+      count: counts[dimCount - i - 1],
+    }));
+  }
+  return [];
+}
+
+/** TypeScript addition: a struct has children; a DTL also has a relation, but it is read whole, like a value */
+function elementKind(varType: PVartypeListElement): "struct" | "value" {
+  const isStruct = varType.offsetInfoType!.hasRelation() && varType.softdatatype !== Softdatatype.S7COMMP_SOFTDATATYPE_DTL;
+  return isStruct ? "struct" : "value";
+}
+
+/** TypeScript addition: the elements of an array variable, e.g. "samples[0]" to "samples[3]" */
+function arrayElements(name: string, symbol: string, varType: PVartypeListElement): BrowseChild[] {
+  const dims = arrayDimensions(varType);
+  const index = dims.map((dim) => dim.lowerBound); // the first element
+  const children: BrowseChild[] = [];
+  for (;;) {
+    const child = new BrowseChild();
+    child.name = `${name}[${index.join(",")}]`;
+    child.symbol = `${symbol}[${index.join(",")}]`;
+    child.softdatatype = varType.softdatatype;
+    child.kind = elementKind(varType);
+    children.push(child);
+    // the next element: the last index moves fastest, as TIA Portal lists them
+    let d = dims.length - 1;
+    while (d >= 0 && ++index[d] >= dims[d].lowerBound + dims[d].count) {
+      index[d] = dims[d].lowerBound;
+      d--;
+    }
+    if (d < 0) return children;
+  }
+}
+
 const hex = (n: number): string => (n >>> 0).toString(16).toUpperCase();
 const hex4 = (n: number): string => hex(n).padStart(4, "0");
 
@@ -1184,6 +1251,100 @@ export class S7CommPlusConnection {
       // TODO: implement s5timers and counters... no one uses them anymore anyway
     }
     return null;
+  }
+
+  /**
+   * TypeScript addition: the children of a symbol, one level down, to show the PLC program as a tree: the variables
+   * of a DB (the symbol is the DB name) or of a struct, the elements of an array. A DTL is a value: it is read whole.
+   * Their names are in the format of getPlcTagBySymbol(), which finds every child except structs and arrays of
+   * structs (their members and elements, yes). Returns null if the symbol does not exist, and an empty list for a value.
+   * @throws Error Symbol syntax error, Out of bounds, Could not get type info
+   */
+  async browseChildren(symbolStr: string): Promise<BrowseChild[] | null> {
+    // make sure we have the db list
+    if (this.dbInfoList === null) {
+      const r = await this.getListOfDatablocks();
+      if (r.res !== 0) {
+        return null;
+      }
+      this.dbInfoList = r.dbInfoList;
+    }
+    const symbol = { value: symbolStr };
+    const levelName = this.parseSymbolLevel(symbol);
+    const dbInfo = this.dbInfoList.find((dbi) => dbi.db_name === levelName);
+    if (dbInfo !== undefined) {
+      if (symbol.value === "") return this.typeInfoChildren(dbInfo.db_block_ti_relid, symbolLevel(levelName));
+      return this.browseChildrenBySymbol(dbInfo.db_block_ti_relid, symbol, symbolLevel(levelName));
+    }
+    // Not a DB: a PLC tag of the bit memory, the outputs or the inputs, searched as getPlcTagBySymbol() does
+    for (const areaTiRelId of [0x90030000, 0x90020000, 0x90010000]) {
+      const children = await this.browseChildrenBySymbol(areaTiRelId, { value: symbolStr }, "");
+      if (children !== null) return children;
+    }
+    return null;
+  }
+
+  /**
+   * TypeScript addition: the PLC tags of the inputs ("I"), the outputs ("Q") or the bit memory ("M"), as
+   * browseChildren() gives the variables of a DB.
+   * @throws Error Could not get type info
+   */
+  browseArea(area: "I" | "Q" | "M"): Promise<BrowseChild[]> {
+    const areaTiRelId = { I: 0x90010000, Q: 0x90020000, M: 0x90030000 }[area];
+    return this.typeInfoChildren(areaTiRelId, "");
+  }
+
+  /** TypeScript addition: browseChildren() one level at a time, as browsePlcTagBySymbol() does for a tag */
+  private async browseChildrenBySymbol(
+    tiRelId: number, symbol: { value: string }, parent: string,
+  ): Promise<BrowseChild[] | null> {
+    const pObj = await this.getTypeInfoByRelId(tiRelId);
+    if (pObj === undefined) throw new Error("Could not get type info");
+    const levelName = this.parseSymbolLevel(symbol);
+    const idx = pObj.varnameList?.names?.indexOf(levelName) ?? -1;
+    if (idx < 0) return null;
+    const varType = pObj.vartypeList!.elements[idx];
+    let path = (parent === "" ? "" : parent + ".") + symbolLevel(levelName);
+    if (arrayDimensions(varType).length > 0) {
+      if (symbol.value === "") return arrayElements(levelName, path, varType);
+      path += this.takeArrayIndex(symbol, varType); // one element, e.g. "[3]"
+    }
+    if (elementKind(varType) === "struct") {
+      const relationId = (varType.offsetInfoType as unknown as IOffsetInfoType_Relation).getRelationId();
+      if (symbol.value === "") return this.typeInfoChildren(relationId, path);
+      return this.browseChildrenBySymbol(relationId, symbol, path);
+    }
+    return symbol.value === "" ? [] : null; // a value has no children, and nothing can follow it
+  }
+
+  /** TypeScript addition: takes the index of one array element from the symbol, e.g. "[3]" or "[1,2]", and checks it */
+  private takeArrayIndex(symbol: { value: string }, varType: PVartypeListElement): string {
+    const m = /^\[ *(-?\d+(?: *, *-?\d+)*) *\]/.exec(symbol.value);
+    if (m === null) throw new Error("Symbol syntax error");
+    this.parseSymbolLevel(symbol); // removes the index from the symbol
+    const indexes = m[1].split(",").map((e) => parseInt(e, 10));
+    const dims = arrayDimensions(varType);
+    const outside = (i: number, d: number) => i < dims[d].lowerBound || i >= dims[d].lowerBound + dims[d].count;
+    // first the number of indexes: with too many, dims[d] would not exist
+    if (indexes.length !== dims.length || indexes.some(outside)) throw new Error("Out of bounds");
+    return `[${indexes.join(",")}]`;
+  }
+
+  /** TypeScript addition: the variables of a type info (a DB, a struct or an area) as children of parent */
+  private async typeInfoChildren(tiRelId: number, parent: string): Promise<BrowseChild[]> {
+    const pObj = await this.getTypeInfoByRelId(tiRelId);
+    if (pObj === undefined) throw new Error("Could not get type info");
+    const names = pObj.varnameList?.names ?? [];
+    return names.map((name, i) => {
+      const varType = pObj.vartypeList!.elements[i];
+      const child = new BrowseChild();
+      child.name = name;
+      child.symbol = (parent === "" ? "" : parent + ".") + symbolLevel(name);
+      child.softdatatype = varType.softdatatype;
+      child.dimensions = arrayDimensions(varType);
+      child.kind = child.dimensions.length > 0 ? "array" : elementKind(varType);
+      return child;
+    });
   }
 
   getListOfDatablocks(): Promise<{ res: number; dbInfoList: DatablockInfo[] }> {
